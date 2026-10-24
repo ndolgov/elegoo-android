@@ -27,10 +27,13 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+
+import kotlinx.coroutines.*
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.OutputStream
 import java.net.Socket
+import java.nio.charset.StandardCharsets
 
 // --- Protocol Data Models ---
 @Serializable
@@ -62,42 +65,67 @@ interface CarTransport {
 class TcpCarTransport(
     private val onTelemetryReceived: (String) -> Unit
 ) : CarTransport {
-    private var socket: Socket? = null
-    private var outputStream: OutputStream? = null
+
+    // 1. Explicit lifecycle container for the background reading loop
+    private val transportScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var listeningJob: Job? = null
+
+    // 2. Mark fields as @Volatile to guarantee visibility across different threads
+    @Volatile private var socket: Socket? = null
+    @Volatile private var outputStream: OutputStream? = null
 
     override suspend fun connect(ip: String, port: Int): Boolean = withContext(Dispatchers.IO) {
+        println("Connecting TcpCarTransport")
         try {
-            disconnect()
-            socket = Socket(ip, port).apply {
-                soTimeout = 3000
-            }
-            outputStream = socket?.getOutputStream()
+            disconnect() // Ensure past connections are cleaned up safely
 
-            // Start listening loop in background
-            launch(Dispatchers.IO) {
+            val newSocket = Socket(ip, port).apply { soTimeout = 3000 }
+            socket = newSocket
+            outputStream = newSocket.getOutputStream()
+
+            // FIX: Launch the listening loop on the dedicated transportScope instead of withContext.
+            // This prevents connect() from hanging indefinitely.
+            listeningJob = transportScope.launch {
                 try {
-                    val reader = BufferedReader(InputStreamReader(socket?.getInputStream()))
-                    while (socket?.isConnected == true && !socket!!.isClosed) {
+                    val reader = BufferedReader(InputStreamReader(newSocket.getInputStream()))
+                    // Use currentCoroutineContext().isActive to cooperatively react to cancellation
+                    while (currentCoroutineContext().isActive && newSocket.isConnected && !newSocket.isClosed) {
                         val line = reader.readLine() ?: break
-                        onTelemetryReceived(line)
+
+                        // FIX: Ensure the telemetry string callback is executed safely on the Main thread
+                        // so the UI can process it directly without thread violations.
+                        withContext(Dispatchers.Main) {
+                            onTelemetryReceived(line)
+                        }
                     }
                 } catch (e: Exception) {
-                    // Connection closed or dropped
+                    println("Handled/Closed drop: " + e.message)
+                } finally {
+                    // Auto-cleanup if the remote server drops the connection
+                    disconnect()
                 }
             }
             true
         } catch (e: Exception) {
+            println("Client connect failed")
             e.printStackTrace()
             false
         }
     }
 
-    override suspend fun disconnect() = withContext(Dispatchers.IO) {
+    override suspend fun disconnect(): Unit = withContext(Dispatchers.IO) {
+        println("Disconnecting TcpCarTransport")
         try {
+            // Cancel the infinite reading loop immediately
+            listeningJob?.cancelAndJoin()
+            listeningJob = null
+
             outputStream?.close()
             socket?.close()
         } catch (e: Exception) {
-            e.printStackTrace()
+            println("Disconnect failed" + e.message)
+            //e.printStackTrace()
+
         } finally {
             socket = null
             outputStream = null
@@ -106,16 +134,20 @@ class TcpCarTransport(
 
     override suspend fun sendCommand(cmd: ElegooCommand): Boolean = withContext(Dispatchers.IO) {
         try {
+            val currentStream = outputStream ?: return@withContext false
             val jsonStr = Json.encodeToString(cmd) + "\n"
-            outputStream?.write(jsonStr.toByteArray(Charsets.UTF_8))
-            outputStream?.flush()
+            currentStream.write(jsonStr.toByteArray(StandardCharsets.UTF_8))
+            currentStream.flush()
             true
         } catch (e: Exception) {
+            println("Send command failed")
             e.printStackTrace()
+
             false
         }
     }
 
+    // Thread-safe view thanks to @Volatile visibility mappings
     override fun isConnected(): Boolean = socket?.isConnected == true && !(socket?.isClosed ?: true)
 }
 
